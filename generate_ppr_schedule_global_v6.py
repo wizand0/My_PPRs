@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-generate_ppr_schedule_global.py
+generate_ppr_schedule_global_v6.py
 
 Глобальный планировщик ППР для листа «ППР».
 
@@ -19,10 +19,15 @@ generate_ppr_schedule_global.py
   ТО-4 = 1 раз в год
 
 Для стандартного набора 2/1/1 целевые точки сезона примерно такие:
-  ТО-4 ~ 20% сезона
-  ТО-2 ~ 45%
-  ТО-3 ~ 70%
-  ТО-2 ~ 90%
+  ТО-4 ~ 12% сезона (обычно I квартал)
+  ТО-2 ~ 34% (обычно II квартал)
+  ТО-3 ~ 60% (обычно III квартал)
+  ТО-2 ~ 84% (обычно IV квартал)
+
+Главное правило: специальные ТО (ТО-2/ТО-3/ТО-4) взаимоисключающие
+внутри раздела по кварталу — не более одного специального ТО в каждом
+календарном квартале. Если технические окна делают это невозможным,
+алгоритм допускает вынужденный fallback и выдаёт предупреждение.
 
 Это даёт интервал ТО-4 -> ТО-3 около половины сезона и не создаёт
 искусственных цепочек вроде ТО-3 на неделях 18,19,20.
@@ -58,6 +63,11 @@ SPECIAL_SPREAD_WEIGHT = 2.5
 SPECIAL_MONTH_WEIGHT = 55.0
 SPECIAL_MONTH_ZERO_BONUS = 18.0
 TO1_LOAD_WEIGHT = 100.0
+MIN_SPECIAL_GAP_FLOOR = 7.0
+SPECIAL_GAP_WEIGHT = 180.0
+MIN_SPECIAL_GAP_FLOOR = 7.0
+SPECIAL_GAP_WEIGHT = 180.0
+SPECIAL_SEQUENCE_WEIGHT = 3.0
 
 
 def normalize(v):
@@ -86,6 +96,11 @@ def week_in_window(week, start, end):
 def cyclic_week_distance(a, b):
     d = abs(a - b)
     return min(d, 53 - d)
+
+
+def quarter_of_month(month):
+    """Квартал календарного года: 1=янв-мар, 2=апр-июн, 3=июл-сен, 4=окт-дек."""
+    return (month - 1) // 3 + 1
 
 
 def find_week_row_and_data_col(ws):
@@ -244,28 +259,40 @@ def month_candidates(g, month, cols_by_month):
     return list(cols)
 
 
-def target_week(g, to_num, occurrence, cols_by_month):
-    """Базовая целевая точка специального ТО.
+def special_phase(g, to_num, occurrence):
+    """Целевая доля сезона для специального ТО внутри раздела.
 
-    Это только мягкая цель. Глобальный планировщик дополнительно
-    балансирует нагрузку по неделям, поэтому свободные разделы не
-    скапливаются все в одном квартале.
+    Для стандартного набора получается цепочка:
+    ТО-4 -> ТО-2 -> ТО-3 -> ТО-2.
+    Это помогает избежать ТО-4 и ТО-2 в соседних месяцах и длинного
+    периода без специальных работ.
     """
-    months = g["months"]
-    all_weeks = [w for m in months for _, w in month_candidates(g, m, cols_by_month)]
+    if to_num == 4:
+        return 0.12
+    if to_num == 3:
+        return 0.60
+    if to_num == 2:
+        return 0.34 if occurrence == 0 else 0.84
+    return 0.50
+
+
+def target_week(g, to_num, occurrence, cols_by_month):
+    """Мягкая целевая точка специального ТО внутри сезона."""
+    all_weeks = [w for m in g["months"] for _, w in month_candidates(g, m, cols_by_month)]
     if not all_weeks:
         return 1
     lo, hi = min(all_weeks), max(all_weeks)
-    if to_num == 4:
-        # Для ТО-4 без узкого сезонного окна стараемся уйти из
-        # перегруженного начала года в середину сезона. Узкие окна
-        # всё равно жёстко ограничат кандидатов ниже.
-        frac = 0.50
-    elif to_num == 3:
-        frac = 0.78
-    else:
-        frac = 0.45 if occurrence == 0 else 0.90
-    return lo + (hi - lo) * frac
+    return lo + (hi - lo) * special_phase(g, to_num, occurrence)
+
+
+def min_special_gap(g, cols_by_month):
+    """Желательный минимальный интервал между специальными ТО раздела."""
+    all_weeks = [w for m in g["months"] for _, w in month_candidates(g, m, cols_by_month)]
+    if len(all_weeks) < 2 or len(g["events"]) <= 1:
+        return MIN_SPECIAL_GAP_FLOOR
+    span = max(all_weeks) - min(all_weeks)
+    # Для 4 специальных ТО в сезоне 1-51 получается примерно 8 недель.
+    return max(MIN_SPECIAL_GAP_FLOOR, span / (len(g["events"]) + 1) * 0.65)
 
 
 def preferred_window(g, to_num):
@@ -426,25 +453,47 @@ def global_hard_assignment(groups, cols_by_month, used3_locked, used4_locked):
     # окна имеют приоритет. При 27 крупных ТО получается около 2.25/месяц.
     desired_month_load = total_events / 12.0 if total_events else 0.0
 
-    # Состояние: стоимость, назначения, занятые месяцы разделов,
+    # Состояние: стоимость, назначения, занятые месяцы и кварталы разделов,
     # недели ТО-3/ТО-4 и месячная загрузка крупных ТО.
-    states = [(0.0, {}, defaultdict(set), set(used3_locked),
+    states = [(0.0, {}, defaultdict(set), defaultdict(set), set(used3_locked),
                set(used4_locked), Counter())]
-    BEAM = 1200
+    BEAM = 250
 
     for e in events:
         new_states = []
         gid = e["g"]["id"]
-        for cost, amap, group_months, u3, u4, month_load in states:
+        for cost, amap, group_months, group_quarters, u3, u4, month_load in states:
             gm = group_months[gid]
+            gq = group_quarters[gid]
             week_load = _special_week_load(u3, u4)
             for m, col, week in e["candidates"]:
                 if m in gm:
+                    continue
+                # Жёсткое правило: не более одного специального ТО в квартале
+                # внутри одного раздела. Если это ТО-2, ТО-3 или ТО-4 —
+                # правило одинаковое: они взаимоисключающие.
+                q = quarter_of_month(m)
+                if q in gq:
                     continue
                 if e["t"] == 3 and week in u3:
                     continue
                 if e["t"] == 4 and week in u4:
                     continue
+
+                # v5: если для этого события есть варианты с нормальным
+                # интервалом, не рассматриваем кандидатов, которые ломают
+                # минимальный интервал внутри данного раздела.
+                prior_weeks = [v[2] for (kgid, _), v in amap.items() if kgid == gid]
+                gap_min = min_special_gap(e["g"], cols_by_month)
+                if prior_weeks and any(abs(week - pw) < gap_min for pw in prior_weeks):
+                    feasible_gap = any(
+                        m2 not in gm and
+                        quarter_of_month(m2) not in gq and
+                        all(abs(w2 - pw) >= gap_min for pw in prior_weeks)
+                        for m2, _, w2 in e["candidates"]
+                    )
+                    if feasible_gap:
+                        continue
 
                 # Недельная загрузка.
                 new_week_load = week_load[week] + 1
@@ -463,6 +512,17 @@ def global_hard_assignment(groups, cols_by_month, used3_locked, used4_locked):
 
                 target_penalty = abs(week - e["target"]) * SPECIAL_SPREAD_WEIGHT
 
+                # v5: равномерность специальных ТО внутри одного раздела.
+                # Не допускаем искусственной цепочки ТО-4 -> ТО-2 и затем
+                # длительного периода только с ТО-1.
+                prior_weeks = [v[2] for (kgid, _), v in amap.items() if kgid == gid]
+                if prior_weeks:
+                    gap_min = min_special_gap(e["g"], cols_by_month)
+                    for pw in prior_weeks:
+                        gap = abs(week - pw)
+                        if gap < gap_min:
+                            target_penalty += (gap_min - gap) ** 2 * SPECIAL_GAP_WEIGHT
+
                 # Выход за техническое окно возможен только в fallback-случае.
                 ps, pe = e["pref"]
                 if ps is not None and not week_in_window(week, ps, pe):
@@ -479,6 +539,8 @@ def global_hard_assignment(groups, cols_by_month, used3_locked, used4_locked):
 
                 ngm = defaultdict(set, {k: set(v) for k, v in group_months.items()})
                 ngm[gid].add(m)
+                ngq = defaultdict(set, {k: set(v) for k, v in group_quarters.items()})
+                ngq[gid].add(q)
                 nu3 = set(u3)
                 nu4 = set(u4)
                 if e["t"] == 3:
@@ -489,17 +551,64 @@ def global_hard_assignment(groups, cols_by_month, used3_locked, used4_locked):
                 nml[m] += 1
                 nam = dict(amap)
                 nam[(gid, e["idx"])] = (m, col, week)
-                new_states.append((c, nam, ngm, nu3, nu4, nml))
+                new_states.append((c, nam, ngm, ngq, nu3, nu4, nml))
 
         if not new_states:
-            break
+            # Квартальное правило имеет приоритет, но если технические окна
+            # физически не позволяют разместить событие в свободном квартале,
+            # не теряем ТО: разрешаем технический fallback и пометим его.
+            fallback_states = []
+            for cost, amap, group_months, group_quarters, u3, u4, month_load in states:
+                gm = group_months[gid]
+                gq = group_quarters[gid]
+                week_load = _special_week_load(u3, u4)
+                for m, col, week in e["candidates"]:
+                    if m in gm:
+                        continue
+                    if e["t"] == 3 and week in u3:
+                        continue
+                    if e["t"] == 4 and week in u4:
+                        continue
+                    q = quarter_of_month(m)
+                    # Здесь уже нет состояния, где событие удаётся разместить
+                    # в свободном квартале. Разрешаем второй спец-ТО в квартале
+                    # только как вынужденный fallback.
+                    if q in gq:
+                        pass
+                    # Если дошли сюда, причина невозможности — другие ограничения.
+                    new_week_load = week_load[week] + 1
+                    new_month_load = month_load[m] + 1
+                    c = cost + (new_week_load ** 2) * SPECIAL_LOAD_WEIGHT
+                    c += ((new_month_load - desired_month_load) ** 2 -
+                          ((month_load[m] - desired_month_load) ** 2)) * SPECIAL_MONTH_WEIGHT
+                    c += abs(week - e["target"]) * SPECIAL_SPREAD_WEIGHT
+                    ps, pe = e["pref"]
+                    if ps is not None and not week_in_window(week, ps, pe):
+                        dist = min(abs(week - ps), abs(week - pe))
+                        c += 1000 + dist * 100
+                    ngm = defaultdict(set, {k: set(v) for k, v in group_months.items()})
+                    ngm[gid].add(m)
+                    ngq = defaultdict(set, {k: set(v) for k, v in group_quarters.items()})
+                    ngq[gid].add(q)
+                    nu3, nu4 = set(u3), set(u4)
+                    if e["t"] == 3: nu3.add(week)
+                    else: nu4.add(week)
+                    nml = Counter(month_load); nml[m] += 1
+                    nam = dict(amap); nam[(gid, e["idx"])] = (m, col, week)
+                    fallback_states.append((c, nam, ngm, ngq, nu3, nu4, nml))
+            if not fallback_states:
+                # Совсем нет допустимого места — оставляем событие без назначения.
+                e["unassigned"] = True
+                continue
+            e["quarter_fallback"] = True
+            new_states = fallback_states
         new_states.sort(key=lambda x: x[0])
         unique = {}
         for st in new_states:
             # Сохраняем разные месячные профили и недельные профили.
             key = (
-                tuple(sorted(st[3])), tuple(sorted(st[4])),
-                tuple(sorted(st[5].items())),
+                tuple(sorted(st[4])), tuple(sorted(st[5])),
+                tuple(sorted(st[6].items())),
                 tuple(sorted((k, v[0]) for k, v in st[1].items())),
             )
             if key not in unique:
@@ -567,14 +676,53 @@ def assign_soft_to2(groups, cols_by_month, hard_assignments, used2_locked):
         g["id"]: {v[0] for v in hard_assignments.get(g["id"], {}).values()}
         for g in groups
     }
+    used_quarters_by_group = {
+        g["id"]: {quarter_of_month(v[0]) for v in hard_assignments.get(g["id"], {}).values()}
+        for g in groups
+    }
 
     for g, idx, occ, candidates, target in events:
         if not candidates:
             continue
-        available = [x for x in candidates if x[0] not in used_months_by_group[g["id"]]]
+        available = [x for x in candidates
+                     if x[0] not in used_months_by_group[g["id"]]
+                     and quarter_of_month(x[0]) not in used_quarters_by_group[g["id"]]]
+        quarter_fallback = False
+        if not available:
+            # Вынужденный fallback: если технические окна/сезон не дают
+            # свободного квартала, лучше сохранить требуемое ТО и сообщить об этом.
+            available = [x for x in candidates if x[0] not in used_months_by_group[g["id"]]]
+            quarter_fallback = True
         if not available:
             available = candidates
         ps, pe = preferred_window(g, 2)
+
+        # v5: сначала пытаемся оставить только кандидатов с нормальным
+        # интервалом до уже поставленных специальных ТО этого раздела.
+        prior_weeks = [v[2] for v in hard_assignments.get(g["id"], {}).values()]
+        prior_weeks += [v[2] for v in result.get(g["id"], {}).values()]
+        gap_min = min_special_gap(g, cols_by_month)
+        if prior_weeks:
+            # ВАЖНО: квартальное правило жёстче, чем правило интервала.
+            # Сначала оставляем только свободные кварталы, затем среди них
+            # стараемся найти хороший интервал. Если хороший интервал не
+            # получается, выбираем любой свободный квартал, но НЕ нарушаем
+            # квартальную взаимоисключаемость.
+            gap_ok = [x for x in available if all(abs(x[2] - pw) >= gap_min for pw in prior_weeks)]
+            if gap_ok:
+                available = gap_ok
+
+        # Защитная проверка: после любых фильтров нельзя вернуть занятый квартал.
+        occupied_quarters = used_quarters_by_group[g["id"]]
+        quarter_safe = [x for x in available if quarter_of_month(x[0]) not in occupied_quarters]
+        if quarter_safe:
+            available = quarter_safe
+        elif not quarter_fallback:
+            # Теоретически сюда не должны попадать, но если попали — это
+            # означает, что текущий набор кандидатов исчерпал свободные кварталы.
+            # Восстанавливаем кандидатов и фиксируем вынужденный fallback.
+            available = [x for x in candidates if x[0] not in used_months_by_group[g["id"]]]
+            quarter_fallback = True
 
         def score(x):
             m, col, week, in_pref = x
@@ -588,12 +736,24 @@ def assign_soft_to2(groups, cols_by_month, hard_assignments, used2_locked):
             coverage = -14.0 if old == 0 else 0.0
             week_penalty = load[week] * 24.0
             target_penalty = abs(week - target) * 0.8
+
+            # v5: ТО-2 тоже входит в общую последовательность специальных ТО.
+            prior = [v[2] for v in hard_assignments.get(g["id"], {}).values()]
+            prior += [v[2] for v in result.get(g["id"], {}).values()]
+            if prior:
+                gap_min = min_special_gap(g, cols_by_month)
+                for pw in prior:
+                    gap = abs(week - pw)
+                    if gap < gap_min:
+                        target_penalty += (gap_min - gap) ** 2 * SPECIAL_GAP_WEIGHT
+
             pref_penalty = 0.0 if (ps is None or in_pref) else 60.0
             return month_penalty + coverage + week_penalty + target_penalty + pref_penalty
 
         best = min(available, key=lambda x: (score(x), x[2]))
         m, col, week, _ = best
         used_months_by_group[g["id"]].add(m)
+        used_quarters_by_group[g["id"]].add(quarter_of_month(m))
         result[g["id"]][idx] = (m, col, week)
         load[week] += 1
         month_load[m] += 1
@@ -630,7 +790,7 @@ def choose_normal_week(g, month, cols_by_month, special_months, week_load1):
 
 def main():
     if len(sys.argv) < 2:
-        print("Использование: python generate_ppr_schedule_global.py вход.xlsx [выход.xlsx] [задержка_сек]")
+        print("Использование: python generate_ppr_schedule_global_v6.py вход.xlsx [выход.xlsx] [задержка_сек]")
         sys.exit(1)
 
     in_path = Path(sys.argv[1])
@@ -691,7 +851,7 @@ def main():
     print(f"Технические столбцы: {get_column_letter(config_start)}:{get_column_letter(config_start + 11)}")
     print(f"Разделов: {len(groups)}; зафиксировано: {len(locked_groups)}; генерируется: {len(unlocked)}")
     print(f"Правила по умолчанию: ТО-2×{DEFAULT_N2}, ТО-3×{DEFAULT_N3}, ТО-4×{DEFAULT_N4}")
-    print("Глобальная оптимизация: месячные квоты + балансировка специальных ТО и ТО-1 по неделям")
+    print("Глобальная оптимизация v6: квартальная взаимоисключаемость специальных ТО + равномерность + балансировка ТО-1")
     print()
 
     print("Построение общего календаря...")
@@ -744,10 +904,17 @@ def main():
         print(f"       Сезон: {cfg['season_start'] or 1}-{cfg['season_end'] or 53}; "
               f"ТО-2×{cfg['n2']}, ТО-3×{cfg['n3']}, ТО-4×{cfg['n4']}")
         print(f"       Добавлено: ТО-1×{counts[1]}, ТО-2×{counts[2]}, ТО-3×{counts[3]}, ТО-4×{counts[4]}")
+        special_week_list = []
         for t in (2, 3, 4):
             weeks = sorted(to_int(ws.cell(week_row, c).value) for c,v in assignment.items() if v == t)
             if weeks:
                 print(f"       ТО-{t}: недели {', '.join(map(str, weeks))}")
+                special_week_list.extend((w, t) for w in weeks)
+
+        special_week_list.sort()
+        if len(special_week_list) >= 2:
+            gaps = [special_week_list[i+1][0] - special_week_list[i][0] for i in range(len(special_week_list)-1)]
+            print(f"       Интервалы между специальными ТО: {', '.join(map(str, gaps))} нед.")
 
         # Очистка ТОЛЬКО недель D:BL.
         for r in g["leaf_rows"]:
@@ -799,15 +966,30 @@ def main():
         if len(set(names)) > 1:
             warnings.append(f"Неделя {week}: конфликт ТО-4: {', '.join(sorted(set(names)))}")
 
-    # Проверка одного ТО на месяц для каждого раздела.
+    # Проверка: не более одного специального ТО на квартал для каждого раздела.
     for g in unlocked:
         amap = assignments[g["id"]]
         months = [m for m,_,_ in amap.values()]
         weeks = [w for _,_,w in amap.values()]
         if len(months) != len(set(months)):
             warnings.append(f"{g['id']}: более одного специального ТО попало в один месяц.")
+        quarters = [quarter_of_month(m) for m in months]
+        if len(quarters) != len(set(quarters)):
+            warnings.append(
+                f"{g['id']}: в одном квартале размещено более одного специального ТО "
+                f"(кварталы: {', '.join(map(str, sorted(quarters)))}) — проверьте технические окна."
+            )
         if len(weeks) != len(set(weeks)):
             warnings.append(f"{g['id']}: два специальных ТО попали на одну неделю.")
+        if len(weeks) >= 2:
+            ordered = sorted(weeks)
+            gap_min = min_special_gap(g, cols_by_month)
+            for a, b in zip(ordered, ordered[1:]):
+                if b - a < gap_min - 1e-9:
+                    warnings.append(
+                        f"{g['id']}: малый интервал между специальными ТО: {b-a} нед. "
+                        f"(желательный минимум {gap_min:.1f} нед.)."
+                    )
 
     wb.save(out_path)
 
@@ -822,7 +1004,7 @@ def main():
     print(f"ТО-4: {totals[4]}")
     print(f"Уникальных недель ТО-3: {len(week_to3)}")
     print(f"Уникальных недель ТО-4: {len(week_to4)}")
-    print(f"Недель с ТО-2: {len(week_to2)}")
+    print(f"ТО-2: {totals[2]} работ, распределены по {len(week_to2)} неделям")
 
     def compact_load(d):
         return ", ".join(f"{w}:{len(set(ns))}" for w,ns in sorted(d.items()))
